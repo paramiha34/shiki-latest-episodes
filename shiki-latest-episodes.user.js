@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shikimori: Latest Episodes
 // @namespace    shiki-latest-episodes
-// @version      1.10
+// @version      1.11
 // @description  Replaces the home page “Currently Airing” block with the 8 most recently aired episodes (newest on the left), with filters
 // @match        https://shikimori.io/*
 // @run-at       document-idle
@@ -29,7 +29,7 @@
   const DAY = 24 * 60 * 60 * 1000;
   const DATA_TTL = 10 * 60 * 1000;        // refetch data every 10 min
   const SETTINGS_KEY = 'sle_settings_v3';
-  const DATA_KEY = 'sle_data_v5';
+  const DATA_KEY = 'sle_data_v6';
   const POSTER_KEY = 'sle_posters_v1';
   const HENTAI_KEY = 'sle_hentai_id';
   const log = [];
@@ -67,7 +67,7 @@
       reset: 'Сбросить фильтры', empty: 'Ничего не подходит под фильтры', debug: 'отладка',
       tSplit: 'Скоро выйдут | Уже вышли', tFilters: 'Фильтры', tReload: 'Обновить данные',
       tipKind: 'Тип', tipEpisodes: 'Эпизоды', tipNext: 'Следующий эпизод', tipGenres: 'Жанры',
-      tipRating: 'рейтинг',
+      tipRating: 'рейтинг', addToList: 'Добавить в список', removeFromList: 'Удалить из списка',
       ep: 'Эп.',
       justNow: 'только что', hAgo: (n) => `${n} ч. назад`, dAgo: (n) => `${n} дн. назад`,
       inMin: (n) => `через ${n} мин.`, inH: (n) => `через ${n} ч.`,
@@ -100,7 +100,7 @@
       reset: 'Reset filters', empty: 'Nothing matches the filters', debug: 'debug',
       tSplit: 'Upcoming | Aired', tFilters: 'Filters', tReload: 'Refresh data',
       tipKind: 'Kind', tipEpisodes: 'Episodes', tipNext: 'Next episode', tipGenres: 'Genres',
-      tipRating: 'rating',
+      tipRating: 'rating', addToList: 'Add to list', removeFromList: 'Remove from list',
       ep: 'Ep.',
       justNow: 'just now', hAgo: (n) => `${n}h ago`, dAgo: (n) => `${n}d ago`,
       inMin: (n) => `in ${n} min`, inH: (n) => `in ${n}h`,
@@ -301,16 +301,23 @@
     }
   }
 
+  // Besides the status we keep the rate id (needed to change or remove it)
+  // and the user id (needed to add new ones)
   async function loadMyRates() {
+    const empty = { rates: {}, rateInfo: {}, userId: null };
     try {
       const me = await getJSON('/api/users/whoami');
-      if (!me?.id) return {};
-      const rates = await getJSON(
+      if (!me?.id) return empty;
+      const list = await getJSON(
         `/api/v2/user_rates?user_id=${me.id}&target_type=Anime&limit=1000`);
-      return Object.fromEntries(rates.map((r) => [r.target_id, r.status]));
+      return {
+        userId: me.id,
+        rates: Object.fromEntries(list.map((r) => [r.target_id, r.status])),
+        rateInfo: Object.fromEntries(list.map((r) => [r.target_id, { id: r.id, episodes: r.episodes }])),
+      };
     } catch (e) {
       log.push('  ✗ my list: ' + e.message);
-      return {};
+      return empty;
     }
   }
 
@@ -362,8 +369,8 @@
     const ids = [...new Set([...candidates, ...upcoming].map((a) => a.id))];
     const byAnime = await loadGenresByAnime(ids, posters);
     store.set(POSTER_KEY, posters);
-    const [genreOptions, rates] = await Promise.all([loadGenreOptions(byAnime), loadMyRates()]);
-    const data = { time: Date.now(), candidates, upcoming, byAnime, genreOptions, rates };
+    const [genreOptions, mine] = await Promise.all([loadGenreOptions(byAnime), loadMyRates()]);
+    const data = { time: Date.now(), candidates, upcoming, byAnime, genreOptions, ...mine };
     if (candidates.length) store.set(DATA_KEY, data); // don't cache an empty result
     return data;
   }
@@ -741,6 +748,7 @@
             const node = doc.querySelector('.b-catalog_entry-tooltip')
                       || doc.querySelector('.tooltip-details');
             if (!node) continue;
+            cleanTooltip(node);
             return node.classList.contains('tooltip-details') ? node.innerHTML : node.outerHTML;
           } catch (e) {
             log.push('  ✗ tooltip: ' + e.message);
@@ -752,6 +760,38 @@
       tipCache.set(id, job);
     }
     return tipCache.get(id);
+  }
+
+  // The tooltip page also has a big poster, but the site's own hover tooltip
+  // doesn't show it (and it squeezes the text into a narrow column), so drop it.
+  // Small images inside the description text are left alone.
+  function cleanTooltip(root) {
+    // poster: the image link and anything left of it
+    root.querySelectorAll('.image-link, picture').forEach((n) => n.remove());
+    root.querySelectorAll('img').forEach((img) => {
+      if (img.closest('.b-text_with_paragraphs, .text')) return;
+      // remove the whole wrapper around the poster, not just the <img>
+      let target = img;
+      while (
+        target.parentElement && target.parentElement !== root &&
+        target.parentElement.children.length === 1 &&
+        !target.parentElement.matches('.inner, .entry-tooltip_container')
+      ) target = target.parentElement;
+      target.remove();
+    });
+    // the site's scripts turn these into links, we do it ourselves
+    root.querySelectorAll('.linkeable[data-href]').forEach((n) => {
+      const link = document.createElement('a');
+      link.className = n.className.replace(/\blinkeable\b/, '').trim();
+      link.href = n.dataset.href;
+      link.innerHTML = n.innerHTML;
+      n.replaceWith(link);
+    });
+    // the button wrapper has a class on the site, the styles depend on it
+    const rate = root.querySelector('.b-user_rate');
+    if (rate && rate.parentElement && rate.parentElement !== root) {
+      rate.parentElement.classList.add('flexible-button');
+    }
   }
 
   // simple tooltip from our own data, in case the site's one doesn't load
@@ -780,7 +820,10 @@
         ${line(t.tipGenres, genres)}
         ${+a.score > 0 ? `<div class="rating"><span>${esc(a.score)}</span>
           <span class="text">${t.tipRating}</span></div>` : ''}
-      </div></div></div>`;
+      </div></div>
+      <div class="flexible-button">
+        <div class="b-user_rate anime-${a.id}" data-target_id="${a.id}" data-target_type="Anime"></div>
+      </div></div>`;
   }
 
   function ensureTip() {
@@ -788,13 +831,18 @@
     tipEl = document.createElement('div');
     tipEl.className = 'tooltip minified sle-tooltip';
     tipEl.style.cssText = 'position: absolute; display: none;';
+    // same structure as the site's tooltip, the border/shadow pieces live inside .clearfix
+    const shadows = ['top', 'top-right', 'right', 'bottom-right', 'bottom', 'bottom-left', 'left', 'top-left']
+      .map((d) => `<div class="dropshadow-${d}"></div>`).join('');
     tipEl.innerHTML = `
       <div class="tooltip-inner">
         <div class="tooltip-arrow" style="top: 40px;"></div>
-        <div class="clearfix"><div class="close"></div><div class="tooltip-details"></div></div>
-      </div>
-      ${['top', 'top-right', 'right', 'bottom-right', 'bottom', 'bottom-left', 'left', 'top-left']
-        .map((d) => `<div class="dropshadow-${d}"></div>`).join('')}`;
+        <div class="clearfix">
+          <div class="close"></div>
+          <div class="tooltip-details"></div>
+          ${shadows}
+        </div>
+      </div>`;
     tipEl.addEventListener('mouseenter', () => clearTimeout(hideTimer));
     tipEl.addEventListener('mouseleave', scheduleHide);
     tipEl.addEventListener('click', onTipClick);
@@ -836,22 +884,104 @@
       html = fallbackTooltip(a, future);
     }
     if (tipFor !== a.id || !card.isConnected) return; // mouse is already somewhere else
-    el.querySelector('.tooltip-details').innerHTML = html;
+    const details = el.querySelector('.tooltip-details');
+    details.innerHTML = html;
+    // the tooltip page sometimes comes without the rating, add it from our data
+    const inner = details.querySelector('.inner');
+    if (inner && !inner.querySelector('.rating') && +a.score > 0) {
+      inner.querySelector(':scope > .data:empty')?.remove();
+      inner.insertAdjacentHTML('beforeend', `<div class="rating"><span>${esc(a.score)}</span>`
+        + `<span class="text">${T().tipRating}</span></div>`);
+    }
+    fillUserRate(details.querySelector('.b-user_rate'), a.id);
     el.style.display = 'block';
     positionTip(el, card);
   }
 
-  // To the right of the poster like on the site, or to the left if there's no room
+  // To the right of the poster like on the site, or to the left if there's no room.
+  // The tooltip's top lines up with the top of the poster, so the anime title sits at that level.
   function positionTip(el, card) {
-    const r = (card.querySelector('img')?.parentElement || card).getBoundingClientRect();
+    // measure the poster <img> itself: its wrapper is an inline element, and an inline
+    // wrapper reports a thin box down at the bottom of the image, not the image's top
+    const img = card.querySelector('img');
+    const imgRect = img?.getBoundingClientRect();
+    const r = imgRect && imgRect.height > 20 ? imgRect : card.getBoundingClientRect();
     const arrow = el.querySelector('.tooltip-arrow');
-    const w = el.offsetWidth;
-    let left = r.right + 12;
-    const flip = left + w > document.documentElement.clientWidth - 8;
-    if (flip) left = Math.max(8, r.left - w - 12);
-    el.style.left = left + window.scrollX + 'px';
-    el.style.top = Math.max(0, r.top + window.scrollY - 20) + 'px';
+    const box = el.querySelector('.tooltip-inner');
+
+    // Don't guess what the tooltip is positioned against: put it at 0,0, see where
+    // the visible box actually lands, and shift by the difference.
+    // (The outer div is just a frame for the arrow; the box sits 20px right and ~44px lower.)
+    el.style.left = '0px';
+    el.style.top = '0px';
+    const b = box.getBoundingClientRect();
+
+    let boxLeft = r.right + 14;
+    const flip = boxLeft + b.width > document.documentElement.clientWidth - 8;
+    if (flip) boxLeft = Math.max(8, r.left - 14 - b.width);
     arrow.style.display = flip ? 'none' : '';
+
+    el.style.left = boxLeft - b.left + 'px';
+    el.style.top = r.top - b.top + 'px'; // top of the box = top of the poster, like on the site
+  }
+
+  // The "Add to list" button. On the site it's drawn by the site's scripts
+  // (the tooltip page only has an empty <div class="b-user_rate to-process">),
+  // so we draw the same markup ourselves.
+  const STATUS_ORDER = ['completed', 'dropped', 'on_hold', 'planned', 'rewatching', 'watching'];
+
+  function fillUserRate(rateEl, animeId) {
+    if (!rateEl) return;
+    rateEl.classList.remove('to-process');
+    if (!data.userId) { rateEl.innerHTML = ''; return; } // not logged in
+
+    const t = T();
+    const id = Number(animeId || rateEl.dataset.target_id);
+    const status = data.rates[id];
+    const info = data.rateInfo?.[id];
+    const saved = Boolean(status && info?.id);
+    const name = (st) => `<span class="status-name" data-text="${esc(t.lists[st] || st)}"></span>`;
+
+    rateEl.dataset.target_id = id;
+    rateEl.dataset.model = JSON.stringify({ id: info?.id ?? null, target_id: id, status: status || 'planned' });
+
+    const trigger = saved
+      ? `<div class="text add-trigger"><span class="edit"></span>${name(status)}${
+        info.episodes > 0 && /watching/.test(status) ? `<span class="current-episodes"> – ${info.episodes}</span>` : ''}</div>`
+      : `<div class="text add-trigger" data-status="planned"><span class="plus"></span>`
+        + `<span class="status-name" data-text="${esc(t.addToList)}"></span></div>`;
+
+    const options = STATUS_ORDER
+      .filter((st) => !saved || st !== status)
+      .map((st) => `<div class="option add-trigger" data-status="${st}"><div class="text">${name(st)}</div></div>`)
+      .join('');
+    const remove = saved
+      ? `<div class="option remove-trigger" data-action="/api/v2/user_rates/${info.id}" data-method="delete">`
+        + `<div class="text"><span class="status-name" data-text="${esc(t.removeFromList)}"></span></div></div>`
+      : '';
+
+    rateEl.innerHTML = `
+      <div>
+        <div class="b-add_to_list ${saved ? status : 'planned'}">
+          <form action="/api/v2/user_rates${saved ? '/' + info.id : ''}" data-method="${saved ? 'PATCH' : 'POST'}">
+            <input type="hidden" name="frontend" value="1">
+            <input type="hidden" name="user_rate[user_id]" value="${data.userId}">
+            <input type="hidden" name="user_rate[target_id]" value="${id}">
+            <input type="hidden" name="user_rate[target_type]" value="Anime">
+            <input type="hidden" name="user_rate[status]" value="${saved ? status : 'planned'}">
+            <div class="trigger"><div class="trigger-arrow"></div>${trigger}</div>
+            <div class="expanded-options" style="height: 0px; display: block;">${options}${remove}</div>
+          </form>
+        </div>
+      </div>`;
+  }
+
+  function toggleOptions(rateEl) {
+    const options = rateEl.querySelector('.expanded-options');
+    if (!options) return;
+    const open = options.style.height === '0px';
+    options.style.height = open ? options.scrollHeight + 'px' : '0px';
+    rateEl.querySelector('.b-add_to_list')?.classList.toggle('expanded', open);
   }
 
   // "Add to list" in the tooltip. The site's scripts don't know about our tooltip,
@@ -863,14 +993,10 @@
     }
     const rateEl = e.target.closest('.b-user_rate');
     if (!rateEl) return;
-    const options = rateEl.querySelector('.expanded-options');
-    if (e.target.closest('.trigger-arrow')) {
+    const mainButton = e.target.closest('.trigger .add-trigger');
+    if (e.target.closest('.trigger-arrow') || (mainButton && !mainButton.dataset.status)) {
       e.preventDefault();
-      if (options) {
-        const open = options.style.height !== 'auto';
-        options.style.height = open ? 'auto' : '0px';
-        rateEl.classList.toggle('expanded', open);
-      }
+      toggleOptions(rateEl);
       return;
     }
     // "Remove from list" has the request url right on it:
@@ -931,25 +1057,32 @@
       });
       log.push(`${method} ${action.replace(location.origin, '')} → ${res.status}`);
       if (!res.ok) throw new Error('user_rate ' + res.status);
+      let saved = null;
+      try { saved = await res.json(); } catch {}
 
       // save the new status (in the cache too) and update the card
       if (targetId) {
-        const apply = (rates) => { if (status) rates[targetId] = status; else delete rates[targetId]; };
-        apply(data.rates);
+        const apply = (d) => {
+          d.rateInfo ??= {};
+          if (status) {
+            d.rates[targetId] = status;
+            const old = d.rateInfo[targetId] || {};
+            d.rateInfo[targetId] = { id: saved?.id ?? old.id, episodes: saved?.episodes ?? old.episodes ?? 0 };
+          } else {
+            delete d.rates[targetId];
+            delete d.rateInfo[targetId];
+          }
+        };
+        apply(data);
         const cached = store.get(DATA_KEY, null);
-        if (cached) { apply(cached.rates); store.set(DATA_KEY, cached); }
-        tipCache.delete(targetId);
+        if (cached) { apply(cached); store.set(DATA_KEY, cached); }
         current?.inner.querySelectorAll('article.b-catalog_entry').forEach((card) => {
           if (card.id !== String(targetId)) return;
           LIST_KEYS.forEach((k) => card.classList.remove(k));
           if (status) card.classList.add(status);
         });
       }
-      if (tipCard && String(tipFor) === String(targetId)) {
-        const { card, a, future, urls } = tipCard;
-        tipFor = null;
-        await showTip(card, a, future, urls); // reload the tooltip so it shows the new status
-      }
+      fillUserRate(rateEl, targetId); // redraw the button with the new status
       renderCards(); // the list filter might hide or show it now
     } catch (err) {
       log.push('  ✗ ' + err.message);
@@ -1328,7 +1461,8 @@
     .catch((e) => {
       log.push('✗ ' + e.message);
       // empty data, so it says "nothing found" instead of loading forever
-      data = { time: 0, candidates: [], upcoming: [], byAnime: {}, genreOptions: [], rates: {} };
+      data = { time: 0, candidates: [], upcoming: [], byAnime: {}, genreOptions: [],
+        rates: {}, rateInfo: {}, userId: null };
     })
     .finally(() => {
       renderAll();
