@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shikimori: Latest Episodes
 // @namespace    shiki-latest-episodes
-// @version      1.9
+// @version      1.10
 // @description  Replaces the home page “Currently Airing” block with the 8 most recently aired episodes (newest on the left), with filters
 // @match        https://shikimori.io/*
 // @run-at       document-idle
@@ -13,22 +13,21 @@
 // @updateURL    https://github.com/paramiha34/shiki-latest-episodes/raw/main/shiki-latest-episodes.user.js
 // ==/UserScript==
 
-// The script runs on every page: Shikimori navigates between pages without
-// a full reload, so if you reach the home page from another page, the script
-// must already be running to notice it.
+// Runs on every page, not just the home page: Shikimori switches pages without
+// reloading, so the script has to be around already when you land on home.
 //
-// Even with @grant none, Greasemonkey runs the script in a sandbox where fetch
-// does not resolve relative paths, so every URL is built as an absolute one.
+// Note: Greasemonkey sandboxes the script even with @grant none, and fetch there
+// doesn't understand relative paths. That's why all URLs are made absolute.
 
 (() => {
   'use strict';
 
-  const LIMIT = 8;                        // cards in the block
-  const HALF = LIMIT / 2;                 // "upcoming | aired" mode: 4 on each side
-  const SKELETON_MS = 300;                // how long the placeholder shows when content changes
-  const DEBUG = false;                    // true shows the debug panel under the block
+  const LIMIT = 8;                        // how many cards to show
+  const HALF = LIMIT / 2;                 // split mode: 4 upcoming + 4 aired
+  const SKELETON_MS = 300;                // placeholder time, so the row doesn't jump
+  const DEBUG = false;                    // set to true to see the debug panel
   const DAY = 24 * 60 * 60 * 1000;
-  const DATA_TTL = 10 * 60 * 1000;        // data cache lifetime: 10 minutes
+  const DATA_TTL = 10 * 60 * 1000;        // refetch data every 10 min
   const SETTINGS_KEY = 'sle_settings_v3';
   const DATA_KEY = 'sle_data_v5';
   const POSTER_KEY = 'sle_posters_v1';
@@ -36,21 +35,18 @@
   const log = [];
 
 
-  // ---------- language ----------
-  // Shikimori writes the user's settings into <body> attributes:
-  //   data-locale            — interface language (ru / en)
-  //   data-localized_genres  — language of genre names
-  //   data-localized_names   — language of anime titles
-  // These are three independent profile settings, so each is read separately.
-  // They are re-read every time, since the language can change without
-  // the script being restarted.
+  // Language. Shikimori puts the profile settings on <body>:
+  //   data-locale           - site language (ru / en)
+  //   data-localized_genres - genre names language
+  //   data-localized_names  - anime titles language
+  // They're separate checkboxes in the profile, so we check each one.
+  // Read fresh every time in case the user switches language.
   const bodyLang = (attr) => (document.body?.dataset[attr] === 'en' ? 'en' : 'ru');
   const uiLang = () => bodyLang('locale');
   const genresLang = () => bodyLang('localized_genres');
   const namesLang = () => bodyLang('localized_names');
 
-  // Button icon for the help text: literal [ ] brackets around the icon, in a
-  // fixed-width box so every description starts at the same position
+  // [icon] for the help popup. Fixed width so all the lines start in the same place
   const keyIcon = (c) =>
     `<span class="sle-key"><span>[</span><span class="sle-key-icon">${c}\uFE0E</span><span>]</span></span>`;
 
@@ -70,6 +66,8 @@
       any: 'любой', loading: 'загрузка…', failed: 'не загрузились',
       reset: 'Сбросить фильтры', empty: 'Ничего не подходит под фильтры', debug: 'отладка',
       tSplit: 'Скоро выйдут | Уже вышли', tFilters: 'Фильтры', tReload: 'Обновить данные',
+      tipKind: 'Тип', tipEpisodes: 'Эпизоды', tipNext: 'Следующий эпизод', tipGenres: 'Жанры',
+      tipRating: 'рейтинг',
       ep: 'Эп.',
       justNow: 'только что', hAgo: (n) => `${n} ч. назад`, dAgo: (n) => `${n} дн. назад`,
       inMin: (n) => `через ${n} мин.`, inH: (n) => `через ${n} ч.`,
@@ -101,6 +99,8 @@
       any: 'any', loading: 'loading…', failed: 'failed to load',
       reset: 'Reset filters', empty: 'Nothing matches the filters', debug: 'debug',
       tSplit: 'Upcoming | Aired', tFilters: 'Filters', tReload: 'Refresh data',
+      tipKind: 'Kind', tipEpisodes: 'Episodes', tipNext: 'Next episode', tipGenres: 'Genres',
+      tipRating: 'rating',
       ep: 'Ep.',
       justNow: 'just now', hAgo: (n) => `${n}h ago`, dAgo: (n) => `${n}d ago`,
       inMin: (n) => `in ${n} min`, inH: (n) => `in ${n}h`,
@@ -120,14 +120,14 @@
   };
   const T = () => I18N[uiLang()];
 
-  // Internal list-status keys (used to strip planned/watching… classes from cards)
+  // list statuses, used to clear planned/watching/etc classes from cards
   const LIST_KEYS = Object.keys(I18N.ru.lists);
-  // Kind labels in both languages, to find them inside the template card
+  // kind names in both languages, to find them in the site's card
   const ALL_KIND_LABELS = [...Object.values(I18N.ru.kinds), ...Object.values(I18N.en.kinds)];
 
   const GROUPS = ['list', 'kind', 'genre', 'theme'].map((key) => ({ key }));
 
-  // ---------- storage ----------
+  // localStorage helpers
 
   const store = {
     get(key, def) {
@@ -138,11 +138,11 @@
     },
   };
 
-  // Hentai is hidden by default. On Shikimori it is genre id 12; once the genre
-  // list loads, the id is re-checked by name (see fixHentaiId).
+  // Hentai is hidden by default. It's genre 12 on Shikimori, but we double check
+  // by name once genres load, just in case (fixHentaiId).
   const hentaiId = () => store.get(HENTAI_KEY, '12');
 
-  // include — "only these", exclude — "without these"
+  // include = only these, exclude = hide these
   const defaultFilters = () => {
     const f = Object.fromEntries(GROUPS.map((g) => [g.key, { include: [], exclude: [] }]));
     f.genre.exclude.push(hentaiId());
@@ -154,7 +154,7 @@
   for (const g of GROUPS) settings.filters[g.key] ??= { include: [], exclude: [] };
   const saveSettings = () => store.set(SETTINGS_KEY, settings);
 
-  // ---------- network ----------
+  // Network
 
   async function getJSON(url, opts = {}) {
     const full = new URL(url, location.origin).href;
@@ -184,7 +184,7 @@
   const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
-  // ---------- candidates: recently aired episodes ----------
+  // Recently aired episodes
 
   const normalize = (anime, episode, date) => ({
     id: anime.id,
@@ -199,7 +199,7 @@
     date,
   });
 
-  // "Episode N aired" events — exact air time
+  // "Episode N aired" news, these have the exact time
   async function fromTopicUpdates() {
     const topics = await getJSON('/api/topics/updates?limit=50');
     return topics
@@ -207,7 +207,7 @@
       .map((t) => normalize(t.linked, t.episode, t.created_at));
   }
 
-  // Calendar: last episode ≈ next one − 7 days (for weekly shows)
+  // From the calendar: last episode is roughly next episode minus a week
   async function fromCalendar(list) {
     if (!list) throw new Error('calendar failed to load');
     const now = Date.now();
@@ -218,7 +218,7 @@
       .filter((a) => new Date(a.date).getTime() <= now);
   }
 
-  // Use both sources: filters need a pool of spare candidates
+  // Use both sources, so there's enough left after filtering
   async function loadCandidates(cal) {
     const all = [];
     for (const src of [fromTopicUpdates, () => fromCalendar(cal)]) {
@@ -229,8 +229,8 @@
     return all.filter((a) => !seen.has(a.id) && seen.add(a.id));
   }
 
-  // Upcoming episodes: each ongoing in the calendar has the time of its next episode.
-  // Shikimori stores only the next one, so "4 upcoming" means 4 different titles.
+  // Upcoming episodes. The calendar only knows the next episode of each show,
+  // so the 4 upcoming cards are always 4 different anime.
   function upcomingFrom(cal) {
     if (!cal) return [];
     const now = Date.now();
@@ -243,16 +243,15 @@
       .filter((a) => !seen.has(a.id) && seen.add(a.id));
   }
 
-  // ---------- genres, themes and posters ----------
+  // Genres, themes, posters
 
-  // genre.kind on Shikimori: "genre", "demographic" (shounen, seinen…) or "theme".
-  // Demographics are shown together with genres, as in the site's own filters.
+  // Shikimori has genre, demographic (shounen, seinen...) and theme.
+  // Demographics go with genres, same as the site's filters.
   const groupOf = (g) => (g.kind === 'theme' ? 'theme' : 'genre');
 
-  // Also fetch current poster URLs: the old REST API image paths
-  // return a "404" placeholder on the new engine.
+  // Grab posters here too: the old API image links show a "404" picture now.
   async function loadGenresByAnime(ids, posters) {
-    const map = {}; // animeId → [{id, group}]
+    const map = {}; // anime id -> its genres
     try {
       for (let i = 0; i < ids.length; i += 50) {
         const chunk = ids.slice(i, i + 50).join(',');
@@ -268,7 +267,7 @@
     } catch (e) {
       log.push('  ✗ graphql: ' + e.message + ' → REST one by one');
     }
-    // Fallback: /api/animes/:id, with pauses because of the rate limit
+    // Plan B: ask for each anime separately, slowly, because of the rate limit
     for (const id of ids.slice(0, 30)) {
       try {
         const a = await getJSON(`/api/animes/${id}`);
@@ -295,7 +294,7 @@
         .map((g) => ({ id: String(g.id), name: g.name, russian: g.russian, group: groupOf(g) }));
     } catch (e) {
       log.push('  ✗ genre list (REST): ' + e.message);
-      // Without the genre list, show only the ids that were seen
+      // no genre names at all, so just show the ids we have
       const seen = new Map();
       Object.values(byAnime).flat().forEach((g) => seen.set(g.id, g));
       return [...seen.values()].map((g) => ({ ...g, name: '#' + g.id }));
@@ -315,19 +314,19 @@
     }
   }
 
-  // Poster cache is separate and long-lived: a title's poster rarely changes
+  // Posters are cached separately and kept for good, they almost never change
   const getPosterCache = () => store.get(POSTER_KEY, {});
   const posterOf = (a) => getPosterCache()[a.id] || '';
 
-  // Fallback: open the anime page and take og:image from <head>
+  // Plan B: open the anime page and take the og:image
   async function fetchPosterFromPage(url) {
     const res = await fetch(url, { credentials: 'include' });
     log.push(`GET ${url.replace(location.origin, '')} → ${res.status} (poster)`);
     const html = await res.text();
     const m = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)/i)
            || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image/i);
-    // For 18+ titles the site puts its logo into og:image instead of the poster;
-    // skip that — real posters live under /uploads/poster/animes/
+    // 18+ titles have the site logo there instead of a poster, skip those.
+    // Real posters are under /uploads/poster/animes/
     if (!m || !/\/animes\//.test(m[1])) return null;
     return abs(m[1]);
   }
@@ -347,7 +346,7 @@
     }
   }
 
-  // ---------- loading with cache ----------
+  // Loading (with cache)
 
   async function loadData(force = false) {
     const cached = store.get(DATA_KEY, null);
@@ -365,11 +364,11 @@
     store.set(POSTER_KEY, posters);
     const [genreOptions, rates] = await Promise.all([loadGenreOptions(byAnime), loadMyRates()]);
     const data = { time: Date.now(), candidates, upcoming, byAnime, genreOptions, rates };
-    if (candidates.length) store.set(DATA_KEY, data); // don't cache a failed load
+    if (candidates.length) store.set(DATA_KEY, data); // don't cache an empty result
     return data;
   }
 
-  // If "Hentai" has a different id in the genre list, fix the default filter
+  // if Hentai turns out to have another id, fix the default filter
   function fixHentaiId(d) {
     const h = d.genreOptions.find((g) => /^(hentai|хентай)$/i.test(g.name) || /^хентай$/i.test(g.russian || ''));
     if (!h || h.id === hentaiId()) return;
@@ -380,7 +379,7 @@
     saveSettings();
   }
 
-  // ---------- filtering ----------
+  // Filters
 
   function valuesOf(a, key, d) {
     switch (key) {
@@ -389,7 +388,7 @@
       case 'genre':
       case 'theme': {
         const g = d.byAnime[a.id];
-        return g ? g.filter((x) => x.group === key).map((x) => x.id) : null; // null = unknown
+        return g ? g.filter((x) => x.group === key).map((x) => x.id) : null; // null if we don't know
       }
     }
   }
@@ -415,15 +414,12 @@
       .sort((a, b) => a.label.localeCompare(b.label, ru ? 'ru' : 'en'));
   }
 
-  // ---------- styles and theme ----------
-  // Colors are not hardcoded: text and background colors are read from the page
-  // (getComputedStyle), so the UI adapts both to plain Shikimori and to Dark Reader
-  // (including its brightness/contrast settings). Other shades (borders, tags,
-  // hints) are mixed from those two.
+  // Styles. No fixed colors: we read text and background color from the page,
+  // so it fits both normal Shikimori and Dark Reader. Everything else
+  // (borders, tags, hints) is mixed from those two.
   //
-  // Our <style> gets class="stylus": Dark Reader skips such styles (that is how
-  // it leaves the Stylus extension alone); otherwise it would darken
-  // the already-adapted dark colors a second time.
+  // class="stylus" is a small trick: Dark Reader leaves Stylus styles alone,
+  // so it won't darken our already dark colors a second time.
 
   const style = document.createElement('style');
   style.className = 'stylus sle-style';
@@ -475,7 +471,7 @@
       background: var(--sle-red-bg); border: 1px solid var(--sle-red-border); color: var(--sle-red); }
     .sle-reset:hover { border-color: var(--sle-red); }
 
-    /* "i" — a letter in a circle, like an info icon */
+    /* the i button, a letter in a circle */
     .sle-ibtn-i { width: 15px; height: 15px; padding: 0; margin: 0 3px; box-sizing: border-box;
       border: 1.5px solid currentColor; border-radius: 50%;
       font: italic 700 10px/12px Georgia, 'Times New Roman', serif; text-align: center; }
@@ -487,7 +483,7 @@
     .sle-info p { margin: 0 0 6px; }
     .sle-info ul { margin: 0 0 8px; padding: 0; list-style: none; }
     .sle-info li { margin: 4px 0; display: flex; align-items: flex-start; gap: 6px; line-height: 20px; }
-    /* Literal [ ] around the icon; fixed width so all descriptions line up */
+    /* [icon] with a fixed width, so the text lines up */
     .sle-key { flex: none; width: 34px; display: flex; justify-content: space-between;
       align-items: center; font-family: monospace; font-size: 13px; line-height: 20px;
       color: var(--sle-muted); }
@@ -496,8 +492,7 @@
     .sle-info .sle-tag { display: inline-block; }
     .sle-info-note { color: var(--sle-muted); font-size: 12px; margin: 0 !important; }
 
-    /* Placeholders: a copy of the site's card with the same size but no content,
-       so the block doesn't jump while cards change */
+    /* Placeholders: same size as real cards, so nothing jumps while they change */
     .sle-skel { pointer-events: none; }
     .sle-skel * { visibility: hidden !important; }
     .sle-skel .sle-skel-box, .sle-skel .sle-skel-line {
@@ -507,7 +502,7 @@
       background: linear-gradient(90deg, var(--sle-chip-bg) 25%, var(--sle-border) 50%, var(--sle-chip-bg) 75%);
       background-size: 300% 100%; animation: sle-shimmer 1.2s ease-in-out infinite; }
     @keyframes sle-shimmer { from { background-position: 100% 0; } to { background-position: 0 0; } }
-    /* Empty slot (fewer cards than places): just a dashed outline */
+    /* empty slot when there aren't enough cards */
     .sle-skel-slot .sle-skel-box { background: none; outline: 1px dashed var(--sle-border);
       outline-offset: -1px; }
     .sle-skel-slot .sle-skel-line { visibility: hidden !important; }
@@ -515,13 +510,13 @@
     .sle-fade { animation: sle-fade .25s ease-out; }
     @keyframes sle-fade { from { opacity: 0; } to { opacity: 1; } }
 
-    /* "Nothing here": takes the same space as a row of cards */
+    /* nothing found, takes the same space as the cards */
     .sle-empty { flex: 1 1 100%; box-sizing: border-box; display: flex; align-items: center;
       justify-content: center; flex-direction: column; gap: 6px; text-align: center;
       border: 1px dashed var(--sle-border); border-radius: 4px; color: var(--sle-muted);
       font-size: 13px; margin-bottom: 30px; }
     .sle-empty-icon { font-size: 22px; line-height: 1; opacity: .7; }
-    /* "upcoming | aired" mode: label over an empty half */
+    /* split mode: text over an empty half */
     .sle-empty-half { position: absolute; z-index: 3; display: flex; align-items: center;
       justify-content: center; text-align: center; padding: 0 12px; box-sizing: border-box;
       color: var(--sle-muted); font-size: 13px; pointer-events: none; }
@@ -530,12 +525,18 @@
       background: rgba(0,0,0,.72); color: #fff; }
     .sle-badge-future { background: rgba(23,96,147,.88); }
 
+    /* tooltip on hover, uses the site's own classes so it looks the same */
+    .sle-tooltip { z-index: 10 !important; }
+    .sle-tooltip .b-user_rate.sle-saving { opacity: .55; pointer-events: none; }
+    .sle-tooltip .b-user_rate.sle-error { outline: 1px solid var(--sle-red); outline-offset: 2px; }
+    .sle-tooltip .expanded-options { overflow: hidden; }
+
     .sle-debug { margin: 6px 0 0; font-size: 11px; }
     .sle-debug summary { cursor: pointer; opacity: .5; }
     .sle-debug pre { font: 10px/1.4 monospace; opacity: .6; white-space: pre-wrap; margin: 4px 0 0; }
   `;
 
-  // A separate small <style> holding only theme variables; it gets rewritten
+  // small separate <style> just for the color variables, rewritten when needed
   const themeStyle = document.createElement('style');
   themeStyle.className = 'stylus sle-theme';
 
@@ -556,10 +557,10 @@
     const ref = current?.inner?.isConnected ? current.inner : document.body;
     if (!ref) return;
     const text = getComputedStyle(ref).color;
-    // Decide dark vs light by text color: Shikimori's background may be an image
+    // light text means dark theme (can't trust the background, it may be a picture)
     const dark = lum(text) > 0.5;
     let bg = sampleBg(ref);
-    // Background must match the theme, otherwise use the default (Dark Reader's is #181a1b)
+    // if the background doesn't fit the theme, use a default one (#181a1b is Dark Reader's)
     if (!bg || (dark ? lum(bg) > 0.4 : lum(bg) < 0.6)) bg = dark ? '#181a1b' : '#ffffff';
     const blue = dark ? '#72b7ec' : '#176093';
     const red = dark ? '#e57b72' : '#c0392b';
@@ -580,19 +581,19 @@
     if (themeStyle.textContent !== css) themeStyle.textContent = css;
   }
 
-  // Dark Reader can be toggled live; it marks this with attributes on <html>
+  // Dark Reader can be turned on/off any time, it changes attributes on <html>
   new MutationObserver(() => requestAnimationFrame(updateTheme))
     .observe(document.documentElement, {
       attributes: true,
       attributeFilter: ['data-darkreader-mode', 'data-darkreader-scheme', 'class', 'data-theme'],
     });
 
-  // ---------- cards ----------
+  // Cards
 
   let data = null;
-  let current = null;      // elements of the currently mounted block
-  let openGroup = null;    // which dropdown is open right now
-  let infoOpen = false;    // whether the "i" help is open
+  let current = null;      // our stuff on the current page
+  let openGroup = null;    // open filter dropdown, if any
+  let infoOpen = false;    // is the help popup open
 
   function replaceText(root, from, to) {
     if (!from || from === to) return;
@@ -606,7 +607,7 @@
 
   const leaves = (root) => [...root.querySelectorAll('*')].filter((el) => !el.children.length);
 
-  // "in 40 min", "in 5h", "tomorrow 17:00", "Oct 14 17:00"
+  // like "in 40 min", "in 5h", "tomorrow 17:00", "Oct 14 17:00"
   function timeUntil(iso) {
     const d = new Date(iso);
     const ms = d - Date.now();
@@ -635,7 +636,7 @@
     const card = template.cloneNode(true);
     const newId = String(a.id);
 
-    // Every attribute holding the old id (id, entry-XXXX, data-track_user_rate…) → new id
+    // swap the old anime id for the new one everywhere (id, entry-XXXX, data attrs)
     if (tpl.id) {
       [card, ...card.querySelectorAll('*')].forEach((el) => {
         for (const attr of [...el.attributes]) {
@@ -648,11 +649,24 @@
     }
     card.querySelectorAll('a[href*="/animes/"]').forEach((el) => el.setAttribute('href', a.url));
 
-    // My-list status (planned, watching…) comes from the new title, not the template
+    // The site only adds its tooltip to cards that exist when the page loads,
+    // so our cards don't get one. Remove the site's hooks (so we never get two
+    // tooltips) and use our own.
+    const tipHost = card.hasAttribute('data-tooltip_url') ? card : card.querySelector('[data-tooltip_url]');
+    const siteTipUrl = tipHost?.getAttribute('data-tooltip_url');
+    [card, ...card.querySelectorAll('*')].forEach((el) => {
+      el.removeAttribute('data-tooltip_url');
+      el.classList.remove('bubbled', 'bubbled-processed');
+    });
+    const tipUrls = [a.url.replace(/\/$/, '') + '/tooltip', siteTipUrl].filter(Boolean);
+    card.addEventListener('mouseenter', () => onCardEnter(card, a, future, tipUrls));
+    card.addEventListener('mouseleave', onCardLeave);
+
+    // list status should be for this anime, not the one we copied the card from
     LIST_KEYS.forEach((s) => card.classList.remove(s));
     if (data.rates[a.id]) card.classList.add(data.rates[a.id]);
 
-    // Title in the language chosen in profile settings
+    // title in the language from the profile
     const shownName = namesLang() === 'ru' ? a.russian : a.name;
 
     // Poster
@@ -665,13 +679,12 @@
       img.alt = shownName;
     });
 
-    // Titles
-    // tpl.russian — the label the template displayed (from the poster's alt),
-    // tpl.name — the original title (from the link's title attribute)
+    // Titles. tpl.russian is what the copied card showed (poster alt),
+    // tpl.name is the original title (link title)
     replaceText(card, tpl.russian, shownName);
     replaceText(card, tpl.name, a.name);
 
-    // Score, kind, year
+    // score, type, year
     const kindLabels = ALL_KIND_LABELS;
     for (const el of leaves(card)) {
       const t = el.textContent.trim();
@@ -685,7 +698,7 @@
       }
     }
 
-    // Episode badge over the poster
+    // episode badge on the poster
     const imgWrap = card.querySelector('img')?.parentElement;
     if (imgWrap) {
       if (getComputedStyle(imgWrap).position === 'static') imgWrap.style.position = 'relative';
@@ -698,16 +711,265 @@
     return card;
   }
 
-  // ---------- rendering ----------
+  // Tooltip on hover. We load the same HTML the site uses (/animes/<id>/tooltip)
+  // and put it in the site's tooltip box. If that fails, we make a simpler one
+  // from what we already know.
 
-  // Which cards the block should contain right now
+  const tipCache = new Map(); // anime id -> tooltip html
+  let tipEl = null;
+  let tipFor = null;          // which anime the tooltip is for
+  let tipCard = null;
+  let showTimer = 0;
+  let hideTimer = 0;
+  const SHOW_DELAY = 350;     // same delay as the site
+  const HIDE_DELAY = 250;
+
+  function fetchTooltip(id, urls) {
+    if (!tipCache.has(id)) {
+      const job = (async () => {
+        for (const url of urls) {
+          try {
+            const full = new URL(url, location.origin).href;
+            const res = await fetch(full, {
+              credentials: 'include',
+              headers: { Accept: 'text/html', 'X-Requested-With': 'XMLHttpRequest' },
+            });
+            log.push(`GET ${full.replace(location.origin, '')} → ${res.status} (tooltip)`);
+            if (!res.ok) continue;
+            const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+            doc.querySelectorAll('script, style').forEach((n) => n.remove());
+            const node = doc.querySelector('.b-catalog_entry-tooltip')
+                      || doc.querySelector('.tooltip-details');
+            if (!node) continue;
+            return node.classList.contains('tooltip-details') ? node.innerHTML : node.outerHTML;
+          } catch (e) {
+            log.push('  ✗ tooltip: ' + e.message);
+          }
+        }
+        throw new Error('no tooltip');
+      })();
+      job.catch(() => tipCache.delete(id)); // try again next time
+      tipCache.set(id, job);
+    }
+    return tipCache.get(id);
+  }
+
+  // simple tooltip from our own data, in case the site's one doesn't load
+  function fallbackTooltip(a, future) {
+    const t = T();
+    const ru = genresLang() === 'ru';
+    const name = namesLang() === 'ru' ? a.russian : a.name;
+    const genres = (data.byAnime[a.id] || [])
+      .map((g) => data.genreOptions.find((o) => o.id === g.id))
+      .filter(Boolean)
+      .map((g) => `<span class="b-tag">${esc((ru && g.russian) || g.name)}</span>`)
+      .join('');
+    const line = (key, value) => !value ? '' : `
+      <div class="line-container"><div class="line">
+        <div class="key">${key}:</div><div class="value">${value}</div>
+      </div></div>`;
+    const kind = [t.kinds[a.kind] || a.kind, a.year].filter(Boolean).map(esc)
+      .map((v) => `<span class="b-tag">${v}</span>`).join('');
+    const aired = future ? a.episode - 1 : a.episode;
+    return `
+      <div class="b-catalog_entry-tooltip"><div class="entry-tooltip_container"><div class="inner">
+        <div class="line name"><a class="data name" href="${esc(a.url)}">${esc(name)}</a></div>
+        ${line(t.tipKind, kind)}
+        ${line(t.tipEpisodes, `${aired} / ${a.total || '?'}`)}
+        ${future ? line(t.tipNext, esc(timeUntil(a.date))) : ''}
+        ${line(t.tipGenres, genres)}
+        ${+a.score > 0 ? `<div class="rating"><span>${esc(a.score)}</span>
+          <span class="text">${t.tipRating}</span></div>` : ''}
+      </div></div></div>`;
+  }
+
+  function ensureTip() {
+    if (tipEl?.isConnected) return tipEl;
+    tipEl = document.createElement('div');
+    tipEl.className = 'tooltip minified sle-tooltip';
+    tipEl.style.cssText = 'position: absolute; display: none;';
+    tipEl.innerHTML = `
+      <div class="tooltip-inner">
+        <div class="tooltip-arrow" style="top: 40px;"></div>
+        <div class="clearfix"><div class="close"></div><div class="tooltip-details"></div></div>
+      </div>
+      ${['top', 'top-right', 'right', 'bottom-right', 'bottom', 'bottom-left', 'left', 'top-left']
+        .map((d) => `<div class="dropshadow-${d}"></div>`).join('')}`;
+    tipEl.addEventListener('mouseenter', () => clearTimeout(hideTimer));
+    tipEl.addEventListener('mouseleave', scheduleHide);
+    tipEl.addEventListener('click', onTipClick);
+    document.body.appendChild(tipEl);
+    return tipEl;
+  }
+
+  function onCardEnter(card, a, future, urls) {
+    clearTimeout(hideTimer);
+    clearTimeout(showTimer);
+    if (tipFor === a.id && tipEl?.style.display === 'block') return;
+    showTimer = setTimeout(() => showTip(card, a, future, urls), SHOW_DELAY);
+  }
+
+  function onCardLeave() {
+    clearTimeout(showTimer);
+    scheduleHide();
+  }
+
+  function scheduleHide() {
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(hideTip, HIDE_DELAY);
+  }
+
+  function hideTip() {
+    if (tipEl) tipEl.style.display = 'none';
+    tipFor = null;
+    tipCard = null;
+  }
+
+  async function showTip(card, a, future, urls) {
+    const el = ensureTip();
+    tipFor = a.id;
+    tipCard = { card, a, future, urls };
+    let html;
+    try {
+      html = await fetchTooltip(a.id, urls);
+    } catch {
+      html = fallbackTooltip(a, future);
+    }
+    if (tipFor !== a.id || !card.isConnected) return; // mouse is already somewhere else
+    el.querySelector('.tooltip-details').innerHTML = html;
+    el.style.display = 'block';
+    positionTip(el, card);
+  }
+
+  // To the right of the poster like on the site, or to the left if there's no room
+  function positionTip(el, card) {
+    const r = (card.querySelector('img')?.parentElement || card).getBoundingClientRect();
+    const arrow = el.querySelector('.tooltip-arrow');
+    const w = el.offsetWidth;
+    let left = r.right + 12;
+    const flip = left + w > document.documentElement.clientWidth - 8;
+    if (flip) left = Math.max(8, r.left - w - 12);
+    el.style.left = left + window.scrollX + 'px';
+    el.style.top = Math.max(0, r.top + window.scrollY - 20) + 'px';
+    arrow.style.display = flip ? 'none' : '';
+  }
+
+  // "Add to list" in the tooltip. The site's scripts don't know about our tooltip,
+  // so we handle the clicks and send the form ourselves.
+  async function onTipClick(e) {
+    if (e.target.closest('.close')) {
+      hideTip();
+      return;
+    }
+    const rateEl = e.target.closest('.b-user_rate');
+    if (!rateEl) return;
+    const options = rateEl.querySelector('.expanded-options');
+    if (e.target.closest('.trigger-arrow')) {
+      e.preventDefault();
+      if (options) {
+        const open = options.style.height !== 'auto';
+        options.style.height = open ? 'auto' : '0px';
+        rateEl.classList.toggle('expanded', open);
+      }
+      return;
+    }
+    // "Remove from list" has the request url right on it:
+    // <div class="option remove-trigger" data-action="/api/v2/user_rates/ID" data-method="delete">
+    const remove = e.target.closest('.remove-trigger[data-action]');
+    if (remove) {
+      e.preventDefault();
+      await saveRate(rateEl, null, remove);
+      return;
+    }
+    const trigger = e.target.closest('.add-trigger[data-status]');
+    if (!trigger) return;
+    e.preventDefault();
+    await saveRate(rateEl, trigger.dataset.status);
+  }
+
+  // pass a status to change it, or null + removeEl to remove from the list
+  async function saveRate(rateEl, status, removeEl = null) {
+    const form = rateEl.querySelector('form');
+    if (!form && !removeEl) return;
+    let model = {};
+    try { model = JSON.parse(rateEl.dataset.model || '{}'); } catch {}
+    const targetId = Number(model.target_id || rateEl.dataset.target_id);
+
+    // CSRF token from <meta>, the field name depends on the site version
+    const csrfParam = document.querySelector('meta[name="csrf-param"]')?.content;
+    const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content;
+
+    let body;
+    let method;
+    let action;
+    if (removeEl) {
+      method = (removeEl.dataset.method || 'DELETE').toUpperCase();
+      action = new URL(removeEl.dataset.action, location.origin).href;
+      if (csrfParam && csrfToken) {
+        body = new FormData();
+        body.set(csrfParam, csrfToken);
+      }
+    } else {
+      body = new FormData(form);
+      body.set('user_rate[status]', status);
+      if (csrfParam && csrfToken) body.set(csrfParam, csrfToken);
+      method = (form.dataset.method || form.getAttribute('method') || 'POST').toUpperCase();
+      action = new URL(form.getAttribute('action'), location.origin).href;
+    }
+
+    rateEl.classList.add('sle-saving');
+    try {
+      const res = await fetch(action, {
+        method,
+        body,
+        credentials: 'include',
+        headers: {
+          Accept: 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+          ...(csrfToken ? { 'X-CSRF-Token': csrfToken, 'X-CSRFToken': csrfToken } : {}),
+        },
+      });
+      log.push(`${method} ${action.replace(location.origin, '')} → ${res.status}`);
+      if (!res.ok) throw new Error('user_rate ' + res.status);
+
+      // save the new status (in the cache too) and update the card
+      if (targetId) {
+        const apply = (rates) => { if (status) rates[targetId] = status; else delete rates[targetId]; };
+        apply(data.rates);
+        const cached = store.get(DATA_KEY, null);
+        if (cached) { apply(cached.rates); store.set(DATA_KEY, cached); }
+        tipCache.delete(targetId);
+        current?.inner.querySelectorAll('article.b-catalog_entry').forEach((card) => {
+          if (card.id !== String(targetId)) return;
+          LIST_KEYS.forEach((k) => card.classList.remove(k));
+          if (status) card.classList.add(status);
+        });
+      }
+      if (tipCard && String(tipFor) === String(targetId)) {
+        const { card, a, future, urls } = tipCard;
+        tipFor = null;
+        await showTip(card, a, future, urls); // reload the tooltip so it shows the new status
+      }
+      renderCards(); // the list filter might hide or show it now
+    } catch (err) {
+      log.push('  ✗ ' + err.message);
+      rateEl.classList.add('sle-error');
+      setTimeout(() => rateEl.classList.remove('sle-error'), 1500);
+    } finally {
+      rateEl.classList.remove('sle-saving');
+    }
+  }
+
+  // Drawing the row
+
+  // which cards should be shown right now
   function computeItems() {
     const now = Date.now();
     if (!settings.split) {
       return { future: [], past: data.candidates.filter((a) => passes(a, data)).slice(0, LIMIT) };
     }
-    // Future on the left, past on the right; the whole row runs from later to earlier:
-    // furthest upcoming … soonest upcoming | most recently aired … older
+    // Upcoming on the left, aired on the right, so the row goes from later to earlier
+    // and "now" is right in the middle
     const future = (data.upcoming || [])
       .filter((a) => new Date(a.date).getTime() > now && passes(a, data))
       .slice(0, HALF)
@@ -720,8 +982,8 @@
     .querySelectorAll('article.b-catalog_entry, .sle-empty, .sle-empty-half, .sle-skel')
     .forEach((el) => el.remove());
 
-  // Placeholder = a copy of the site's card, same size, no content
-  function makeSkel(kind) { // kind: 'anim' — shimmering, 'slot' — empty place
+  // placeholder: copy of the site's card, same size, no content
+  function makeSkel(kind) { // 'anim' shimmers, 'slot' is just an empty place
     const t = current.template;
     const el = t.cloneNode(true);
     el.removeAttribute('id');
@@ -732,7 +994,7 @@
     el.querySelectorAll('a').forEach((n) => { n.removeAttribute('href'); n.tabIndex = -1; });
     const box = el.querySelector('img')?.parentElement;
     box?.classList.add('sle-skel-box');
-    // Turn text lines into bars of the same width
+    // text becomes gray bars of the same width
     leaves(el).forEach((n) => {
       if (n.textContent.trim() && !(box && box.contains(n))) n.classList.add('sle-skel-line');
     });
@@ -741,7 +1003,7 @@
 
   function showSkeleton() {
     const { inner } = current;
-    // Remember the row height so the empty state takes the same space
+    // remember the height so the empty message takes the same space
     current.rowHeight = Math.max(current.rowHeight || 0, inner.offsetHeight || 0);
     clearInner();
     inner.append(...Array.from({ length: LIMIT }, () => makeSkel('anim')));
@@ -755,7 +1017,7 @@
     return el;
   }
 
-  // Label over an empty half in "upcoming | aired" mode
+  // text over an empty half in split mode
   function overlayHalf(slots) {
     if (!slots.length) return;
     const { inner } = current;
@@ -797,18 +1059,19 @@
       if (!past.length) emptyPast = p;
       cards = [...f, ...p];
     } else {
-      cards = fill(past.map((a) => buildCard(a)), LIMIT, false); // newest episode on the left
+      cards = fill(past.map((a) => buildCard(a)), LIMIT, false); // newest on the left
     }
     cards.forEach((c) => c.classList.add('sle-fade'));
     inner.append(...cards);
+    if (tipCard && !tipCard.card.isConnected) hideTip(); // its card is gone
     overlayHalf(emptyFuture);
     overlayHalf(emptyPast);
     current.rowHeight = Math.max(current.rowHeight || 0, inner.offsetHeight || 0);
     fixMissingPosters([...future, ...past]);
   }
 
-  // Repaint the row only when its contents change. Briefly show a same-size
-  // placeholder first so the block doesn't jump.
+  // Only redraw when the cards actually change, and show placeholders for a moment
+  // first so it doesn't jump
   let paintToken = 0;
   function renderCards() {
     const { future, past } = computeItems();
@@ -871,7 +1134,7 @@
   function renderAll() {
     if (!current || !current.inner.isConnected) return;
     updateTheme();
-    // Language-dependent labels are refreshed on every render
+    // labels, in case the language changed
     const t = T();
     if (current.headingNode && current.headingNode.nodeValue !== t.heading) {
       current.headingNode.nodeValue = t.heading;
@@ -894,7 +1157,7 @@
     renderDebug();
   }
 
-  // ---------- mounting into the "Currently Airing" block ----------
+  // Hooking into the "Currently Airing" block
 
   function setup(inner) {
     const fc = inner.closest('.fc-ongoings');
@@ -903,8 +1166,7 @@
     const first = inner.querySelector('article.b-catalog_entry');
     if (!first) return;
 
-    // If the page was restored from the navigation cache, our old elements
-    // may still be there without handlers — remove them
+    // when you go back, the page can come from cache with our old (dead) buttons, remove them
     block.querySelectorAll('.sle-tools, .sle-filters, .sle-debug').forEach((el) => el.remove());
 
     const template = first.cloneNode(true);
@@ -916,9 +1178,7 @@
       name: link?.getAttribute('title') || '',
     };
 
-    // Heading
-    // Its text depends on the site language, so instead of matching a phrase,
-    // replace the longest text in the heading — that is the block title
+    // Heading. Its text depends on the language, so just replace the longest text in it
     let headingNode = null;
     if (head) {
       const walker = document.createTreeWalker(head, NodeFilter.SHOW_TEXT);
@@ -933,7 +1193,7 @@
       if (getComputedStyle(head).position === 'static') head.style.position = 'relative';
     }
 
-    // Heading buttons: mode, filters, info, refresh
+    // buttons in the heading
     const tools = document.createElement('span');
     tools.className = 'sle-tools';
     tools.innerHTML = `
@@ -955,7 +1215,7 @@
     const debugEl = document.createElement('details');
     debugEl.className = 'sle-debug';
     debugEl.innerHTML = '<summary></summary><pre></pre>';
-    debugEl.hidden = !DEBUG; // the panel is kept in code; flip DEBUG to show it
+    debugEl.hidden = !DEBUG; // hidden unless DEBUG is on
     fc.after(debugEl);
 
     current = {
@@ -993,7 +1253,7 @@
           log.push('✗ ' + err.message);
         }
         btn.classList.remove('spin');
-        current.renderedKey = null; // after a manual refresh, repaint regardless
+        current.renderedKey = null; // redraw anyway after a manual refresh
         renderAll();
       }
     });
@@ -1003,7 +1263,7 @@
       const chip = e.target.closest('.sle-chip');
 
       if (chip && key) {
-        // cycle: off → only → without → off
+        // click: only this, again: hide this, again: off
         const f = settings.filters[key];
         const id = chip.dataset.id;
         const drop = (arr) => { const i = arr.indexOf(id); if (i !== -1) arr.splice(i, 1); };
@@ -1024,11 +1284,11 @@
       }
     });
 
-    showSkeleton(); // until data arrives, placeholders instead of random ongoings
+    showSkeleton(); // placeholders instead of random ongoings until data loads
     renderAll();
   }
 
-  // Close the dropdown on a click outside it
+  // close the dropdown when clicking somewhere else
   document.addEventListener('click', (e) => {
     if (openGroup && current && !e.target.closest('.sle-f')) {
       openGroup = null;
@@ -1036,10 +1296,9 @@
     }
   });
 
-  // ---------- page transitions ----------
-  // Shikimori swaps <body> on navigation without a reload, and Greasemonkey does
-  // not re-run the script. So we watch the DOM: as soon as an ongoings block
-  // we haven't touched appears, we mount into it.
+  // Page changes. Shikimori swaps the page without reloading, and Greasemonkey
+  // doesn't run the script again, so we watch the page and hook in whenever
+  // a fresh "Currently Airing" block shows up.
 
   function check() {
     if (!style.isConnected && document.head) document.head.appendChild(style);
@@ -1061,14 +1320,14 @@
   ['turbolinks:load', 'turbo:load', 'page:load'].forEach((ev) => document.addEventListener(ev, check));
   window.addEventListener('popstate', check);
 
-  // ---------- start ----------
+  // Go
 
   check();
   loadData()
     .then((d) => { data = d; fixHentaiId(d); })
     .catch((e) => {
       log.push('✗ ' + e.message);
-      // Empty data, so "nothing here" shows instead of an endless placeholder
+      // empty data, so it says "nothing found" instead of loading forever
       data = { time: 0, candidates: [], upcoming: [], byAnime: {}, genreOptions: [], rates: {} };
     })
     .finally(() => {
