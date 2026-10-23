@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Shikimori: Latest Episodes
-// @namespace    shiki-latest-episodes
-// @version      1.11
+// @name         Shikimori: Latest Episodes (dev)
+// @namespace    shiki-latest-episodes-dev
+// @version      1.12
 // @description  Replaces the home page “Currently Airing” block with the 8 most recently aired episodes (newest on the left), with filters
 // @match        https://shikimori.io/*
 // @run-at       document-idle
@@ -9,8 +9,8 @@
 // @author       paramiha34
 // @homepageURL  https://github.com/paramiha34/shiki-latest-episodes
 // @supportURL   https://github.com/paramiha34/shiki-latest-episodes/issues
-// @downloadURL  https://github.com/paramiha34/shiki-latest-episodes/raw/main/shiki-latest-episodes.user.js
-// @updateURL    https://github.com/paramiha34/shiki-latest-episodes/raw/main/shiki-latest-episodes.user.js
+// @downloadURL  https://github.com/paramiha34/shiki-latest-episodes/raw/dev/shiki-latest-episodes.user.js
+// @updateURL    https://github.com/paramiha34/shiki-latest-episodes/raw/dev/shiki-latest-episodes.user.js
 // ==/UserScript==
 
 // Runs on every page, not just the home page: Shikimori switches pages without
@@ -26,10 +26,17 @@
   const HALF = LIMIT / 2;                 // split mode: 4 upcoming + 4 aired
   const SKELETON_MS = 300;                // placeholder time, so the row doesn't jump
   const DEBUG = false;                    // set to true to see the debug panel
+  // which copy of the script this is (release or dev), taken from the header
+  const SCRIPT_ID = (typeof GM !== 'undefined' && GM.info?.script?.namespace)
+    || (typeof GM_info !== 'undefined' && GM_info.script?.namespace)
+    || 'shiki-latest-episodes-dev';
+  const priority = (id) => (/-dev$/.test(id) ? 2 : 1); // dev beats release
+  // false if the other copy of the script has taken over the block
+  const isOwner = () => current?.inner.closest('.block2')?.dataset.sleOwner === SCRIPT_ID;
   const DAY = 24 * 60 * 60 * 1000;
   const DATA_TTL = 10 * 60 * 1000;        // refetch data every 10 min
   const SETTINGS_KEY = 'sle_settings_v3';
-  const DATA_KEY = 'sle_data_v6';
+  const DATA_KEY = 'sle_data_v7';
   const POSTER_KEY = 'sle_posters_v1';
   const HENTAI_KEY = 'sle_hentai_id';
   const log = [];
@@ -68,6 +75,7 @@
       tSplit: 'Скоро выйдут | Уже вышли', tFilters: 'Фильтры', tReload: 'Обновить данные',
       tipKind: 'Тип', tipEpisodes: 'Эпизоды', tipNext: 'Следующий эпизод', tipGenres: 'Жанры',
       tipRating: 'рейтинг', addToList: 'Добавить в список', removeFromList: 'Удалить из списка',
+      signIn: 'войдите в аккаунт', signInHint: 'Фильтр по спискам работает, только когда вы вошли на Шикимори',
       ep: 'Эп.',
       justNow: 'только что', hAgo: (n) => `${n} ч. назад`, dAgo: (n) => `${n} дн. назад`,
       inMin: (n) => `через ${n} мин.`, inH: (n) => `через ${n} ч.`,
@@ -101,6 +109,7 @@
       tSplit: 'Upcoming | Aired', tFilters: 'Filters', tReload: 'Refresh data',
       tipKind: 'Kind', tipEpisodes: 'Episodes', tipNext: 'Next episode', tipGenres: 'Genres',
       tipRating: 'rating', addToList: 'Add to list', removeFromList: 'Remove from list',
+      signIn: 'sign in first', signInHint: 'The list filter only works when you are signed in to Shikimori',
       ep: 'Ep.',
       justNow: 'just now', hAgo: (n) => `${n}h ago`, dAgo: (n) => `${n}d ago`,
       inMin: (n) => `in ${n} min`, inH: (n) => `in ${n}h`,
@@ -156,9 +165,23 @@
 
   // Network
 
+  // In Firefox a script's own fetch goes out "from the extension", and the site
+  // doesn't treat it as you (login cookies may not be sent). content.fetch sends
+  // the request as the page itself, so we use it when it's there.
+  async function siteFetch(url, opts) {
+    try {
+      if (typeof content !== 'undefined' && typeof content?.fetch === 'function') {
+        return await content.fetch(url, opts);
+      }
+    } catch (e) {
+      log.push('  content.fetch failed, using normal fetch: ' + e.message);
+    }
+    return fetch(url, opts);
+  }
+
   async function getJSON(url, opts = {}) {
     const full = new URL(url, location.origin).href;
-    const res = await fetch(full, {
+    const res = await siteFetch(full, {
       credentials: 'include',
       ...opts,
       headers: { Accept: 'application/json', ...(opts.headers || {}) },
@@ -303,21 +326,35 @@
 
   // Besides the status we keep the rate id (needed to change or remove it)
   // and the user id (needed to add new ones)
+  // Who's logged in: the site puts it on <body data-user='{"id": ...}'>,
+  // so we don't depend on /api/users/whoami (it needs login cookies)
+  function myUserId() {
+    try { return JSON.parse(document.body?.dataset.user || 'null')?.id || null; } catch { return null; }
+  }
+
   async function loadMyRates() {
     const empty = { rates: {}, rateInfo: {}, userId: null };
     try {
-      const me = await getJSON('/api/users/whoami');
-      if (!me?.id) return empty;
-      const list = await getJSON(
-        `/api/v2/user_rates?user_id=${me.id}&target_type=Anime&limit=1000`);
+      let userId = myUserId();
+      if (!userId) userId = (await getJSON('/api/users/whoami'))?.id;
+      if (!userId) return empty;
+      // the list comes in pages of up to 1000
+      const list = [];
+      for (let page = 1; page <= 20; page++) {
+        const part = await getJSON(
+          `/api/v2/user_rates?user_id=${userId}&target_type=Anime&limit=1000&page=${page}`);
+        list.push(...part);
+        if (part.length < 1000) break;
+      }
+      log.push(`  my list: ${list.length} anime`);
       return {
-        userId: me.id,
+        userId,
         rates: Object.fromEntries(list.map((r) => [r.target_id, r.status])),
         rateInfo: Object.fromEntries(list.map((r) => [r.target_id, { id: r.id, episodes: r.episodes }])),
       };
     } catch (e) {
       log.push('  ✗ my list: ' + e.message);
-      return empty;
+      return { ...empty, userId: myUserId() };
     }
   }
 
@@ -327,7 +364,7 @@
 
   // Plan B: open the anime page and take the og:image
   async function fetchPosterFromPage(url) {
-    const res = await fetch(url, { credentials: 'include' });
+    const res = await siteFetch(url, { credentials: 'include' });
     log.push(`GET ${url.replace(location.origin, '')} → ${res.status} (poster)`);
     const html = await res.text();
     const m = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)/i)
@@ -371,7 +408,9 @@
     store.set(POSTER_KEY, posters);
     const [genreOptions, mine] = await Promise.all([loadGenreOptions(byAnime), loadMyRates()]);
     const data = { time: Date.now(), candidates, upcoming, byAnime, genreOptions, ...mine };
-    if (candidates.length) store.set(DATA_KEY, data); // don't cache an empty result
+    // don't cache an empty result, or a broken list load (we'd be stuck with it for 10 min)
+    const listBroken = data.userId && !Object.keys(data.rates).length;
+    if (candidates.length && !listBroken) store.set(DATA_KEY, data);
     return data;
   }
 
@@ -401,7 +440,9 @@
   }
 
   function passes(a, d) {
+    const loggedIn = Boolean(myUserId());
     for (const { key } of GROUPS) {
+      if (key === 'list' && !loggedIn) continue; // no account, no lists to filter by
       const { include, exclude } = settings.filters[key];
       if (!include.length && !exclude.length) continue;
       const vals = valuesOf(a, key, d);
@@ -454,6 +495,10 @@
     .sle-select.open::after { margin-top: -6px; border-top-color: transparent;
       border-bottom-color: var(--sle-muted); }
     .sle-placeholder { color: var(--sle-muted); }
+    /* greyed out (list filter when you're not signed in) */
+    .sle-f-disabled { opacity: .45; cursor: not-allowed; }
+    .sle-f-disabled .sle-select { cursor: not-allowed; pointer-events: none; }
+    .sle-f-disabled .sle-select::after { display: none; }
     .sle-tag { padding: 0 6px; border-radius: 3px; font-size: 12px; line-height: 20px;
       white-space: nowrap; }
     .sle-tag.inc { background: var(--sle-blue-bg); color: var(--sle-blue); }
@@ -737,7 +782,7 @@
         for (const url of urls) {
           try {
             const full = new URL(url, location.origin).href;
-            const res = await fetch(full, {
+            const res = await siteFetch(full, {
               credentials: 'include',
               headers: { Accept: 'text/html', 'X-Requested-With': 'XMLHttpRequest' },
             });
@@ -933,7 +978,8 @@
   function fillUserRate(rateEl, animeId) {
     if (!rateEl) return;
     rateEl.classList.remove('to-process');
-    if (!data.userId) { rateEl.innerHTML = ''; return; } // not logged in
+    const userId = data.userId || myUserId();
+    if (!userId) { rateEl.innerHTML = ''; return; } // not logged in
 
     const t = T();
     const id = Number(animeId || rateEl.dataset.target_id);
@@ -965,7 +1011,7 @@
         <div class="b-add_to_list ${saved ? status : 'planned'}">
           <form action="/api/v2/user_rates${saved ? '/' + info.id : ''}" data-method="${saved ? 'PATCH' : 'POST'}">
             <input type="hidden" name="frontend" value="1">
-            <input type="hidden" name="user_rate[user_id]" value="${data.userId}">
+            <input type="hidden" name="user_rate[user_id]" value="${userId}">
             <input type="hidden" name="user_rate[target_id]" value="${id}">
             <input type="hidden" name="user_rate[target_type]" value="Anime">
             <input type="hidden" name="user_rate[status]" value="${saved ? status : 'planned'}">
@@ -1045,7 +1091,7 @@
 
     rateEl.classList.add('sle-saving');
     try {
-      const res = await fetch(action, {
+      const res = await siteFetch(action, {
         method,
         body,
         credentials: 'include',
@@ -1208,7 +1254,7 @@
   let paintToken = 0;
   function renderCards() {
     const { future, past } = computeItems();
-    const key = [settings.split, uiLang(), namesLang(),
+    const key = [settings.split, uiLang(), namesLang(), Boolean(myUserId()),
       ...future.map((a) => 'f' + a.id), ...past.map((a) => a.id)].join(',');
     if (key === current.renderedKey) return;
     current.renderedKey = key;
@@ -1216,7 +1262,7 @@
     const target = current;
     showSkeleton();
     setTimeout(() => {
-      if (token !== paintToken || target !== current || !target.inner.isConnected) return;
+      if (token !== paintToken || target !== current || !target.inner.isConnected || !isOwner()) return;
       paint(future, past);
     }, SKELETON_MS);
   }
@@ -1230,8 +1276,17 @@
     const popScroll = pop ? pop.scrollTop : 0;
 
     const t = T();
+    const loggedIn = Boolean(myUserId());
     el.innerHTML = GROUPS.map(({ key }) => {
       const title = t.groups[key];
+      // logged out: the list filter is greyed out and says why
+      if (key === 'list' && !loggedIn) {
+        return `
+          <div class="sle-f sle-f-disabled" data-key="list" title="${esc(t.signInHint)}">
+            <div class="sle-f-title">${title}</div>
+            <div class="sle-select"><span class="sle-placeholder">${esc(t.signIn)}</span></div>
+          </div>`;
+      }
       const f = settings.filters[key];
       const opts = optionsFor(key, data);
       const label = (id) => opts.find((o) => o.id === id)?.label || '#' + id;
@@ -1266,6 +1321,7 @@
 
   function renderAll() {
     if (!current || !current.inner.isConnected) return;
+    if (!isOwner()) { current = null; return; } // the dev copy took over, stay out of its way
     updateTheme();
     // labels, in case the language changed
     const t = T();
@@ -1296,14 +1352,24 @@
     const fc = inner.closest('.fc-ongoings');
     const block = inner.closest('.block2') || fc.parentElement;
     const head = block.querySelector('.subheadline');
-    const first = inner.querySelector('article.b-catalog_entry');
-    if (!first) return;
+    // We copy the site's own card to make ours. Keep an untouched copy of it inside
+    // the block, so whoever sets up later (the dev copy taking over, or the page
+    // coming back from cache) copies the real card, not one of our placeholders.
+    let original = block.querySelector('template.sle-original');
+    if (!original) {
+      const first = inner.querySelector('article.b-catalog_entry');
+      if (!first) return;
+      original = document.createElement('template');
+      original.className = 'sle-original';
+      original.content.appendChild(first.cloneNode(true));
+      block.appendChild(original);
+    }
 
     // when you go back, the page can come from cache with our old (dead) buttons, remove them
-    block.querySelectorAll('.sle-tools, .sle-filters, .sle-debug').forEach((el) => el.remove());
+    // (also removes the release copy's stuff when the dev copy takes over)
+    block.querySelectorAll('.sle-tools, .sle-filters, .sle-info, .sle-debug').forEach((el) => el.remove());
 
-    const template = first.cloneNode(true);
-    template.querySelectorAll('.sle-badge').forEach((el) => el.remove());
+    const template = original.content.firstElementChild.cloneNode(true);
     const link = template.querySelector('a[href*="/animes/"]');
     const tpl = {
       id: template.id,
@@ -1392,6 +1458,7 @@
     });
 
     filtersEl.addEventListener('click', (e) => {
+      if (e.target.closest('.sle-f-disabled')) return;
       const key = e.target.closest('.sle-f')?.dataset.key;
       const chip = e.target.closest('.sle-chip');
 
@@ -1441,7 +1508,13 @@
     const inner = document.querySelector('.block2 .fc-ongoings .inner')
                || document.querySelector('.fc-ongoings .inner');
     if (!inner || inner === current?.inner) return;
-    setup(inner);
+    // If both the release and the dev version are turned on, dev wins: it takes
+    // the block even if the release got there first, and the release backs off
+    const block = inner.closest('.block2');
+    const owner = block?.dataset.sleOwner;
+    if (owner && owner !== SCRIPT_ID && priority(owner) >= priority(SCRIPT_ID)) return;
+    block?.setAttribute('data-sle-owner', SCRIPT_ID);
+    setup(inner); // setup also clears out the other copy's buttons and filters
   }
 
   let scheduled = false;
