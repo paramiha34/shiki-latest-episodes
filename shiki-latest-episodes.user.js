@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shikimori: Latest Episodes (dev)
 // @namespace    shiki-latest-episodes-dev
-// @version      1.12
+// @version      1.12.1
 // @description  Replaces the home page “Currently Airing” block with the 8 most recently aired episodes (newest on the left), with filters
 // @match        https://shikimori.io/*
 // @run-at       document-idle
@@ -573,9 +573,14 @@
       justify-content: center; text-align: center; padding: 0 12px; box-sizing: border-box;
       color: var(--sle-muted); font-size: 13px; pointer-events: none; }
     .sle-badge { position: absolute; left: 4px; top: 4px; z-index: 2; pointer-events: none;
-      padding: 1px 5px; border-radius: 3px; font-size: 11px; line-height: 16px; white-space: nowrap;
+      display: flex; flex-direction: column; max-width: calc(100% - 8px); box-sizing: border-box;
+      padding: 2px 5px; border-radius: 3px; font-size: 11px; line-height: 14px;
       background: rgba(0,0,0,.72); color: #fff; }
+    /* each line gets cut with "..." instead of sticking out of the card */
+    .sle-badge > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .sle-badge-ep { font-weight: 600; }
     .sle-badge-future { background: rgba(23,96,147,.88); }
+    .sle-badge-final { background: rgba(46,125,50,.9); }
 
     /* tooltip on hover, uses the site's own classes so it looks the same */
     .sle-tooltip { z-index: 10 !important; }
@@ -686,6 +691,7 @@
   function buildCard(a, future = false) {
     const { template, tpl } = current;
     const card = template.cloneNode(true);
+    card.setAttribute('data-sle-card', '');
     const newId = String(a.id);
 
     // swap the old anime id for the new one everywhere (id, entry-XXXX, data attrs)
@@ -755,12 +761,53 @@
     if (imgWrap) {
       if (getComputedStyle(imgWrap).position === 'static') imgWrap.style.position = 'relative';
       const badge = document.createElement('span');
-      badge.className = 'sle-badge' + (future ? ' sle-badge-future' : '');
-      badge.textContent = `${T().ep} ${a.episode}${a.total ? '/' + a.total : ''} · `
-        + (future ? timeUntil(a.date) : timeAgo(a.date));
+      // the last episode of the show gets a green badge
+      const final = a.total > 0 && a.episode >= a.total;
+      badge.className = 'sle-badge' + (final ? ' sle-badge-final' : future ? ' sle-badge-future' : '');
+      // two short lines instead of one long one, so it fits on the poster in any language
+      badge.innerHTML = `<span class="sle-badge-ep">${T().ep} ${a.episode}${a.total ? '/' + a.total : ''}</span>`
+        + `<span class="sle-badge-time">${esc(future ? timeUntil(a.date) : timeAgo(a.date))}</span>`;
       imgWrap.appendChild(badge);
     }
     return card;
+  }
+
+  // The site puts a small round list-status button in the top right corner of the
+  // poster, right where our badge is. In our block we move it down to sit just
+  // above the score. We only touch our own cards, the rest of the site stays as is.
+  const isScoreText = (el) => /^★?\s*\d{1,2}(\.\d{1,2})?$/.test(el.textContent.trim());
+
+  function moveStatusCircle(card) {
+    const img = card.querySelector('img');
+    if (!img) return;
+    const poster = img.getBoundingClientRect();
+    if (poster.height < 40) {
+      // poster not loaded yet, try again once it is
+      img.addEventListener('load', () => moveStatusCircle(card), { once: true });
+      return;
+    }
+    const positioned = [...card.querySelectorAll('*')].filter((el) =>
+      !el.closest('.sle-badge') && getComputedStyle(el).position === 'absolute');
+    const score = positioned.find(isScoreText)
+      || [...card.querySelectorAll('*')].find((el) => !el.children.length && isScoreText(el));
+    const circle = positioned.find((el) => {
+      if (isScoreText(el) || (score && el.contains(score))) return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.width < 60 && r.top - poster.top < 40 && poster.right - r.right < 40;
+    });
+    if (!circle) return;
+    const c = circle.getBoundingClientRect();
+    const s = score?.getBoundingClientRect();
+    const above = s && s.height ? s.top : poster.bottom - 26;
+    // set it, see where it actually landed, then nudge by the difference
+    const want = above - c.height - 6;
+    const base = (circle.offsetParent || card).getBoundingClientRect();
+    circle.style.setProperty('bottom', 'auto', 'important');
+    circle.style.setProperty('top', `${want - base.top}px`, 'important');
+    const off = circle.getBoundingClientRect().top - want;
+    if (Math.abs(off) > 0.5) {
+      circle.style.setProperty('top', `${want - base.top - off}px`, 'important');
+    }
   }
 
   // Tooltip on hover. We load the same HTML the site uses (/animes/<id>/tooltip)
@@ -1242,6 +1289,9 @@
     }
     cards.forEach((c) => c.classList.add('sle-fade'));
     inner.append(...cards);
+    requestAnimationFrame(() => cards.forEach((c) => {
+      if (c.hasAttribute('data-sle-card')) moveStatusCircle(c);
+    }));
     if (tipCard && !tipCard.card.isConnected) hideTip(); // its card is gone
     overlayHalf(emptyFuture);
     overlayHalf(emptyPast);
@@ -1357,11 +1407,24 @@
     // coming back from cache) copies the real card, not one of our placeholders.
     let original = block.querySelector('template.sle-original');
     if (!original) {
-      const first = inner.querySelector('article.b-catalog_entry');
-      if (!first) return;
+      const all = [...inner.querySelectorAll('article.b-catalog_entry')];
+      // best: one of the site's own cards
+      let first = all.find((c) => !c.classList.contains('sle-skel') && !c.querySelector('.sle-badge'));
+      if (first) {
+        first = first.cloneNode(true);
+      } else {
+        // another copy of the script (e.g. an old release) already swapped the cards:
+        // take one of its finished cards and clean our additions off it
+        const used = all.find((c) => !c.classList.contains('sle-skel'));
+        if (!used) return false; // only placeholders on the page yet, try again in a moment
+        first = used.cloneNode(true);
+        first.querySelectorAll('.sle-badge').forEach((n) => n.remove());
+        first.classList.remove('sle-fade');
+        first.removeAttribute('data-sle-card');
+      }
       original = document.createElement('template');
       original.className = 'sle-original';
-      original.content.appendChild(first.cloneNode(true));
+      original.content.appendChild(first);
       block.appendChild(original);
     }
 
@@ -1513,8 +1576,10 @@
     const block = inner.closest('.block2');
     const owner = block?.dataset.sleOwner;
     if (owner && owner !== SCRIPT_ID && priority(owner) >= priority(SCRIPT_ID)) return;
+    // setup also clears out the other copy's buttons and filters;
+    // it says false when there's no real card to copy yet, then we just try again later
+    if (setup(inner) === false) return;
     block?.setAttribute('data-sle-owner', SCRIPT_ID);
-    setup(inner); // setup also clears out the other copy's buttons and filters
   }
 
   let scheduled = false;
