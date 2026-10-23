@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shikimori: Latest Episodes (dev)
 // @namespace    shiki-latest-episodes-dev
-// @version      1.12.1
+// @version      1.12.2
 // @description  Replaces the home page “Currently Airing” block with the 8 most recently aired episodes (newest on the left), with filters
 // @match        https://shikimori.io/*
 // @run-at       document-idle
@@ -581,6 +581,19 @@
     .sle-badge-ep { font-weight: 600; }
     .sle-badge-future { background: rgba(23,96,147,.88); }
     .sle-badge-final { background: rgba(46,125,50,.9); }
+    /* The round list-status icon is the site's .image-decor::before, top right of the poster.
+       In our cards only, move it down to sit right above the score, so it doesn't cover the badge. */
+    .fc-ongoings .inner article[data-sle-card] .image-decor::before {
+      top: auto !important; bottom: 26px !important; }
+    /* hovering a card fades out the badge, status icon and score, so you can see the poster */
+    .fc-ongoings .inner article[data-sle-card] .sle-badge,
+    .fc-ongoings .inner article[data-sle-card] .collection_score,
+    .fc-ongoings .inner article[data-sle-card] .image-decor::before {
+      transition: opacity .15s ease; }
+    .fc-ongoings .inner article[data-sle-card]:hover .sle-badge,
+    .fc-ongoings .inner article[data-sle-card]:hover .collection_score,
+    .fc-ongoings .inner article[data-sle-card]:hover .image-decor::before {
+      opacity: 0 !important; }
 
     /* tooltip on hover, uses the site's own classes so it looks the same */
     .sle-tooltip { z-index: 10 !important; }
@@ -770,44 +783,6 @@
       imgWrap.appendChild(badge);
     }
     return card;
-  }
-
-  // The site puts a small round list-status button in the top right corner of the
-  // poster, right where our badge is. In our block we move it down to sit just
-  // above the score. We only touch our own cards, the rest of the site stays as is.
-  const isScoreText = (el) => /^★?\s*\d{1,2}(\.\d{1,2})?$/.test(el.textContent.trim());
-
-  function moveStatusCircle(card) {
-    const img = card.querySelector('img');
-    if (!img) return;
-    const poster = img.getBoundingClientRect();
-    if (poster.height < 40) {
-      // poster not loaded yet, try again once it is
-      img.addEventListener('load', () => moveStatusCircle(card), { once: true });
-      return;
-    }
-    const positioned = [...card.querySelectorAll('*')].filter((el) =>
-      !el.closest('.sle-badge') && getComputedStyle(el).position === 'absolute');
-    const score = positioned.find(isScoreText)
-      || [...card.querySelectorAll('*')].find((el) => !el.children.length && isScoreText(el));
-    const circle = positioned.find((el) => {
-      if (isScoreText(el) || (score && el.contains(score))) return false;
-      const r = el.getBoundingClientRect();
-      return r.width > 0 && r.width < 60 && r.top - poster.top < 40 && poster.right - r.right < 40;
-    });
-    if (!circle) return;
-    const c = circle.getBoundingClientRect();
-    const s = score?.getBoundingClientRect();
-    const above = s && s.height ? s.top : poster.bottom - 26;
-    // set it, see where it actually landed, then nudge by the difference
-    const want = above - c.height - 6;
-    const base = (circle.offsetParent || card).getBoundingClientRect();
-    circle.style.setProperty('bottom', 'auto', 'important');
-    circle.style.setProperty('top', `${want - base.top}px`, 'important');
-    const off = circle.getBoundingClientRect().top - want;
-    if (Math.abs(off) > 0.5) {
-      circle.style.setProperty('top', `${want - base.top - off}px`, 'important');
-    }
   }
 
   // Tooltip on hover. We load the same HTML the site uses (/animes/<id>/tooltip)
@@ -1289,9 +1264,6 @@
     }
     cards.forEach((c) => c.classList.add('sle-fade'));
     inner.append(...cards);
-    requestAnimationFrame(() => cards.forEach((c) => {
-      if (c.hasAttribute('data-sle-card')) moveStatusCircle(c);
-    }));
     if (tipCard && !tipCard.card.isConnected) hideTip(); // its card is gone
     overlayHalf(emptyFuture);
     overlayHalf(emptyPast);
